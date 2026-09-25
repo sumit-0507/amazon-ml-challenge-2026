@@ -1,0 +1,21 @@
+# Data, training data, models and run outputs stay out of git
+/dataset/
+/artifacts
+/logs
+/output/
+*.tsv
+*.parquet
+*.npy
+*.npz
+*.joblib
+*.pt
+*.safetensors
+*.bin
+
+# Challenge material and working notes
+/6ab10eb3b23ba_student_resource/
+/document/
+
+# Python
+__pycache__/
+*.pyc
