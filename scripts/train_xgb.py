@@ -207,6 +207,61 @@ def cached_features(key, cand, build):
     return X
 
 
+CE_SCORES = ROOT / "artifacts" / "ce_scores"
+
+
+def ce_scores(ce, run, row_range=None):
+    """Cross-encoder logits of a run (score_cross_encoder.py): query_row, s1_id, ce_logit."""
+    path = CE_SCORES / ce / run
+    if not (path / "_done").exists():
+        sys.exit(f"cross-encoder scores missing or incomplete: {path}")
+    filters = None if row_range is None else [("query_row", ">=", int(row_range[0])),
+                                              ("query_row", "<=", int(row_range[1]))]
+    return pd.read_parquet(path, columns=["query_row", "s1_id", "ce_logit"], filters=filters)
+
+
+def add_ce_features(X, cand, scores, prefix="ce"):
+    """Cross-encoder logit, gap to the query's best logit and rank among the query's scored
+    candidates (NaN for candidates below the cross-encoder's fused-rank cut or not scored)."""
+    logit = cand[["query_row", "s1_id"]].merge(scores, on=["query_row", "s1_id"], how="left").ce_logit.to_numpy(np.float32)
+    by_query = pd.Series(logit).groupby(cand.query_row.to_numpy())
+    X[f"{prefix}_logit"] = logit
+    X[f"{prefix}_gap"] = (logit - by_query.transform("max").to_numpy()).astype(np.float32)
+    X[f"{prefix}_rank"] = by_query.rank(ascending=False, method="first").to_numpy(np.float32)
+    return X
+
+
+CE_PREFIX = {"both": "ce", "name": "cen", "address": "cea"}
+
+
+def ce_names(value):
+    """Cross-encoder score sets of a model: meta 'ce' is None, one name (older models) or a list."""
+    return [] if not value else [value] if isinstance(value, str) else list(value)
+
+
+def ce_prefix(ce):
+    """Feature prefix of a score set, by the text its cross-encoder reads (name | address -> ce,
+    name -> cen, address -> cea). The model is the one named in the set's _done files, else the
+    model folder of the set's own name; neither found: name | address."""
+    model = ce
+    for done in sorted((CE_SCORES / ce).glob("*/_done")):
+        model = (json.loads(done.read_text()).get("models") or [ce])[0]
+        break
+    meta = ROOT / "artifacts" / "cross_encoders" / model / "meta.json"
+    mode = json.loads(meta.read_text()).get("text_mode", "both") if meta.exists() else "both"
+    return CE_PREFIX[mode]
+
+
+def add_all_ce_features(X, cand, ces, run, row_range=None):
+    """Features of every cross-encoder score set in `ces` (see ce_names) for candidates of `run`."""
+    prefixes = [ce_prefix(ce) for ce in ce_names(ces)]
+    if len(set(prefixes)) < len(prefixes):
+        sys.exit(f"cross-encoder score sets {ce_names(ces)} share a feature prefix ({prefixes})")
+    for ce, prefix in zip(ce_names(ces), prefixes):
+        X = add_ce_features(X, cand, ce_scores(ce, run, row_range), prefix)
+    return X
+
+
 def query_embeddings(split, queries):
     path = EMB / f"s23-{split}.npy"
     if not path.exists():
@@ -303,6 +358,10 @@ def main():
     ap.add_argument("--subsample", type=float, default=0.8)
     ap.add_argument("--colsample", type=float, default=0.8)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--ce", nargs="+", help="cross-encoder score sets in artifacts/ce_scores/ (each adds "
+                    "<prefix>_logit, _gap, _rank; prefix ce / cen / cea for name | address / name / address)")
+    ap.add_argument("--fold", choices=["A", "B"], help="fit and validate on this cross-encoder fold only (the "
+                    "fold the cross-encoder was not trained on)")
     args = ap.parse_args()
     name = args.name or f"xgb-{args.train}"
     rc.setup_logging(f"train-{name}")
@@ -322,10 +381,15 @@ def main():
     entities = pd.unique(truth[truth != ""])
     valid_entities = set(entities[rng.random(len(entities)) < args.valid_frac])
     is_valid = np.where(truth != "", pd.Series(truth).isin(valid_entities), rng.random(len(queries)) < args.valid_frac)
-    fit_rows = np.flatnonzero(~is_valid)
+    in_fold = np.ones(len(queries), dtype=bool)
+    if args.fold:  # only records the cross-encoder did not train on
+        import train_cross_encoder as C
+        in_fold = C.folds(queries) == args.fold
+        log.info(f"fold {args.fold}: {in_fold.sum():,} of {len(queries):,} queries")
+    fit_rows = np.flatnonzero(~is_valid & in_fold)
     if len(fit_rows) > args.train_queries:
         fit_rows = np.sort(rng.choice(fit_rows, args.train_queries, replace=False))
-    valid_rows = np.flatnonzero(is_valid)
+    valid_rows = np.flatnonzero(is_valid & in_fold)
     if len(valid_rows) > args.valid_queries:
         valid_rows = np.sort(rng.choice(valid_rows, args.valid_queries, replace=False))
     cand = load_candidates(args.train, np.concatenate([fit_rows, valid_rows]))
@@ -379,12 +443,19 @@ def _train_and_score(args, name, texts, s1_emb, queries, fit_cand, valid_cand, v
     q_emb = query_embeddings(split, queries)
     t0 = time.time()
     negatives = "all" if args.all_negatives else f"h{args.hard_neg}-r{args.rand_neg}"
-    sample_key = f"{args.train}-fit{args.train_queries}-valid{args.valid_queries}-{negatives}-s{args.seed}"
+    sample_key = (f"{args.train}-fit{args.train_queries}-valid{args.valid_queries}-{negatives}-s{args.seed}"
+                  + (f"-fold{args.fold}" if args.fold else ""))
     X_fit = cached_features(f"{sample_key}-fit", fit_cand,
                             lambda: build_features(fit_cand, qtext, texts.s1, q_emb, s1_emb, texts.s1_row))
     log.info(f"  fit features done ({time.time() - t0:.0f}s)")
     X_valid = cached_features(f"{sample_key}-valid", valid_cand,
                               lambda: build_features(valid_cand, qtext, texts.s1, q_emb, s1_emb, texts.s1_row))
+    if args.ce:
+        X_fit = add_all_ce_features(X_fit, fit_cand, args.ce, args.train)
+        X_valid = add_all_ce_features(X_valid, valid_cand, args.ce, args.train)
+        for ce in args.ce:
+            log.info(f"  cross-encoder features from {ce} ({ce_prefix(ce)}_*): "
+                     f"{X_fit[ce_prefix(ce) + '_logit'].notna().mean():.1%} of fit candidates scored")
     log.info(f"features: {X_fit.shape[1]} columns, built in {time.time() - t0:.0f}s"
              f"{'' if q_emb is not None else ' (no embedding feature: s23-' + split + ' embeddings missing)'}")
 
@@ -429,7 +500,10 @@ def _train_and_score(args, name, texts, s1_emb, queries, fit_cand, valid_cand, v
     etext = texts.queries(esplit, equeries.file_row.to_numpy())
     X_eval = cached_features(f"{args.eval}-all", ecand, lambda: build_features(
         ecand, etext, texts.s1, query_embeddings(esplit, equeries), s1_emb, texts.s1_row))
-    p_eval = model.predict(xgb.DMatrix(X_eval, missing=np.nan), iteration_range=(0, model.best_iteration + 1))
+    if args.ce:
+        X_eval = add_all_ce_features(X_eval, ecand, args.ce, args.eval)
+    p_eval = model.predict(xgb.DMatrix(X_eval[feature_names], missing=np.nan),
+                           iteration_range=(0, model.best_iteration + 1))
     eval_singletons = singleton_info(esplit)
     result = evaluate(ecand, equeries, p_eval, best["threshold"], eval_singletons)
     top1 = evaluate(ecand, equeries, -ecand.fused_rank.to_numpy().astype(float), -1.0, eval_singletons)
@@ -445,7 +519,7 @@ def _train_and_score(args, name, texts, s1_emb, queries, fit_cand, valid_cand, v
     MODELS.mkdir(parents=True, exist_ok=True)
     model.save_model(MODELS / f"{name}.json")
     (MODELS / f"{name}.meta.json").write_text(json.dumps({
-        "features": feature_names, "threshold": best["threshold"], "best_iteration": model.best_iteration,
+        "features": feature_names, "ce": args.ce, "threshold": best["threshold"], "best_iteration": model.best_iteration,
         "valid_sweep": sweep, "eval": result, "eval_baseline_top1": top1, "args": vars(args)}, indent=2))
     log.info(f"model -> {MODELS / name}.json (+ .meta.json)")
 

@@ -67,7 +67,9 @@ def main():
     model.set_param({"device": os.environ.get("XGB_DEVICE", "cuda"), "nthread": n_jobs})
     features, n_trees = meta["features"], meta["best_iteration"] + 1
     threshold = args.threshold if args.threshold is not None else meta["threshold"]
-    log.info(f"predict {name}: model {args.model} ({n_trees} trees, threshold {threshold}), runs {args.runs}")
+    args.ce = meta.get("ce")  # cross-encoder score set the model was trained with, if any
+    log.info(f"predict {name}: model {args.model} ({n_trees} trees, threshold {threshold}"
+             + (f", cross-encoder {args.ce}" if args.ce else "") + f"), runs {args.runs}")
 
     t0 = time.time()
     texts = T.Texts(n_jobs, s1_split=s1_split)
@@ -99,7 +101,10 @@ def score_runs(args, texts, s1_emb, model, features, n_trees, threshold, work):
             b = min(a + args.chunk_queries, len(queries))
             cand = pd.read_parquet(T.CAND / f"{run}.parquet", columns=T.CANDIDATE_COLUMNS[:4] + T.CANDIDATE_COLUMNS[5:],
                                    filters=[("query_row", ">=", a), ("query_row", "<", b)]).reset_index(drop=True)
-            X = T.build_features(cand, qtext, texts.s1, q_emb, s1_emb, texts.s1_row)[features]
+            X = T.build_features(cand, qtext, texts.s1, q_emb, s1_emb, texts.s1_row)
+            if args.ce:
+                X = T.add_all_ce_features(X, cand, args.ce, run, (a, b - 1))
+            X = X[features]
             p = model.predict(xgb.DMatrix(X, missing=np.nan), iteration_range=(0, n_trees))
             rows, s1, bp = T.best_candidates(cand, p)
             chunk_pred = pd.DataFrame({"query_entity_id": qids[rows], "best_s1": s1, "p": bp})
@@ -132,20 +137,44 @@ def write_outputs(args, texts, threshold, work, n_jobs):
     log.info(f"matching_results.tsv: {len(result):,} S1 rows, {(result.matched_entity_ids != '').sum():,} with matches "
              f"-> {out / 'matching_results.tsv'}")
 
-    import duckdb
-    con = duckdb.connect()
-    con.execute(f"SET temp_directory='{work / 'duckdb_tmp'}'; SET memory_limit='12GB'; SET threads={n_jobs}")
-    con.register("s1_ids", s1_ids.to_frame())
-    con.execute(f"""
-        COPY (
-            SELECT s.source1_entity_id, c.ids AS candidate_entity_ids  -- NULL is written as an empty field
-            FROM s1_ids s
-            LEFT JOIN (SELECT s1, string_agg(DISTINCT q, ',' ORDER BY q) AS ids
-                       FROM read_parquet('{work / 'candidate_pairs' / '*.parquet'}') GROUP BY s1) c
-              ON c.s1 = s.source1_entity_id
-        ) TO '{out / 'candidate_pairs.tsv'}' (DELIMITER '\t', HEADER)
-    """)
-    log.info(f"candidate_pairs.tsv: candidate pairs grouped by S1 -> {out / 'candidate_pairs.tsv'}")
+    write_candidate_pairs(work, s1_ids, out / "candidate_pairs.tsv")
+
+
+def write_candidate_pairs(work, s1_ids, path, n_buckets=64):
+    """candidate_pairs.tsv with bounded memory: pass 1 splits the (S1, record) pairs into hash
+    buckets by S1 id, pass 2 groups each bucket; S1 entities without candidates get an empty row."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    bucket_dir = work / "cp_buckets"
+    if bucket_dir.exists():
+        for f in bucket_dir.glob("*.parquet"):
+            f.unlink()
+    bucket_dir.mkdir(exist_ok=True)
+    schema = pa.schema([("s1", pa.string()), ("q", pa.string())])
+    writers = [pq.ParquetWriter(bucket_dir / f"{b:03d}.parquet", schema) for b in range(n_buckets)]
+    n_pairs = 0
+    for f in sorted((work / "candidate_pairs").glob("*.parquet")):
+        pairs = pd.read_parquet(f)
+        bucket = (pd.util.hash_array(pairs.s1.to_numpy(dtype=object)) % n_buckets).astype(np.int16)
+        for b, part in pairs.groupby(bucket, sort=False):
+            writers[b].write_table(pa.Table.from_pandas(part, schema=schema, preserve_index=False))
+        n_pairs += len(pairs)
+    for w in writers:
+        w.close()
+    seen = set()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("source1_entity_id\tcandidate_entity_ids\n")
+        for b in range(n_buckets):
+            pairs = pd.read_parquet(bucket_dir / f"{b:03d}.parquet").drop_duplicates()
+            grouped = pairs.sort_values(["s1", "q"]).groupby("s1", sort=False).q.agg(",".join)
+            fh.writelines(f"{s1}\t{ids}\n" for s1, ids in grouped.items())
+            seen.update(grouped.index)
+        missing = [s1 for s1 in s1_ids if s1 not in seen]
+        fh.writelines(f"{s1}\t\n" for s1 in missing)
+    for f in bucket_dir.glob("*.parquet"):
+        f.unlink()
+    log.info(f"candidate_pairs.tsv: {n_pairs:,} pairs, {len(seen):,} S1 with candidates, "
+             f"{len(missing):,} without -> {path}")
 
 
 if __name__ == "__main__":

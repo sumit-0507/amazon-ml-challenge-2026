@@ -15,6 +15,7 @@ on the GPU. For each search, name and address are turned into term vectors
     phonkey   Indian-aware phonetic key per word (ph->f, bh->b, kh->k, gh->g, th->t,
               dh->d, sh->s, ck/q->k, x->ks, z->j, w->v, c->k, ...; doubled letters
               collapsed, vowels and h dropped after the first letter)
+    phonfull  Double Metaphone codes at full length (phonetic keeps 4 characters)
 
 --scoring tfidf  sublinear-tf TF-IDF, L2-normalized: field score = cosine
 --scoring bm25   Lucene BM25 (k1=1.2, b=0.75, idf = ln(1 + (N-df+0.5)/(df+0.5))):
@@ -68,7 +69,7 @@ from address_standardization import equivalent_states, standardize_addresses  # 
 from name_standardization import standardize_names  # noqa: E402
 
 METHODS = ["bi", "tri", "words", "phonetic"]              # default searches (the trained model's)
-ALL_METHODS = METHODS + ["skip", "phonkey"]
+ALL_METHODS = METHODS + ["skip", "phonkey", "phonfull"]
 FIELDS = ["name", "address"]
 TFIDF = ROOT / "artifacts" / "tfidf"
 log = rc.log
@@ -105,6 +106,16 @@ def tok_phonetic(s):
     return [code for w in tok_words(s) for code in _phonetic_codes(w)]
 
 
+@lru_cache(maxsize=1 << 21)
+def _phonetic_codes_full(word):
+    return tuple(dict.fromkeys(code for code in doublemetaphone(word) if code))
+
+
+def tok_phonfull(s):
+    """Double Metaphone codes at full length (phonetic cuts them to 4 characters)."""
+    return [code for w in tok_words(s) for code in _phonetic_codes_full(w)]
+
+
 def tok_skip(s):
     return [w[i] + w[i + 2] for w in _WORD_CHARS.findall(s) if len(w) >= 3 for i in range(len(w) - 2)]
 
@@ -130,7 +141,7 @@ def tok_phonkey(s):
 
 
 TOKENIZERS = {"bi": tok_bi, "tri": tok_tri, "words": tok_words, "phonetic": tok_phonetic,
-              "skip": tok_skip, "phonkey": tok_phonkey}
+              "skip": tok_skip, "phonkey": tok_phonkey, "phonfull": tok_phonfull}
 
 # --------------------------------------------------------------------------
 # Source 1 matrices (fit once, cached)
@@ -281,6 +292,56 @@ def search_block(S1, Qm, s1_rows, q_rows, args, torch, device, methods=METHODS):
         del mats
     return out
 
+
+def block_tables(hits, s1_rows, methods, fuse_order, args):
+    """Per-search hits and RRF-fused candidates of one block, as whole-block array operations.
+
+    Same rows, order and values as fusing each query's lists with rc.fuse: per-search rows
+    are query-major, then search (in `methods` order), then rank; RRF adds 1/(rrf_k + rank)
+    over the searches in `fuse_order` (the same float summation order), and ties keep the
+    order a candidate was first seen in (search, then rank), as the stable sort in rc.fuse.
+    Returns (per_search, fused) frames with j = query position in the block and s1 = global
+    S1 row, or (None, None) when the block has no hit.
+    """
+    per = []
+    for pos, m in enumerate(methods):
+        if m not in hits:
+            continue
+        idx, vals, name_vals, addr_vals = (a.T for a in hits[m])      # [queries x per_search]
+        keep = vals > 0
+        rank = np.cumsum(keep, axis=1)
+        j, c = np.nonzero(keep)                                        # query-major, then list position
+        per.append(pd.DataFrame({"j": j, "pos": pos, "m": m, "rank": rank[j, c], "s1": s1_rows[idx[j, c]],
+                                 "score": vals[j, c], "name": name_vals[j, c], "address": addr_vals[j, c]}))
+    if not per or not sum(len(p) for p in per):
+        return None, None
+    ps = pd.concat(per, ignore_index=True)
+    ps = ps.iloc[np.lexsort((ps["rank"].to_numpy(), ps.pos.to_numpy(), ps.j.to_numpy()))].reset_index(drop=True)
+
+    # candidates in first-seen order: query, then search in fuse order, then rank
+    span = np.int64(s1_rows.max()) + 1
+    pos = ps.pos.to_numpy()
+    fpos = np.array([fuse_order.index(m) if m in fuse_order else -1 for m in methods])[pos]
+    seen = ps.iloc[np.lexsort((ps["rank"].to_numpy(), fpos, ps.j.to_numpy()))]
+    key = seen.j.to_numpy().astype(np.int64) * span + seen.s1.to_numpy()
+    first = ~pd.Series(key).duplicated().to_numpy()
+    fused = pd.DataFrame({"j": seen.j.to_numpy()[first], "s1": seen.s1.to_numpy()[first]})
+    rrf = np.zeros(len(fused))
+    for m in fuse_order:
+        sub = ps[pos == methods.index(m)]
+        at = pd.DataFrame({"score": sub.score.to_numpy(), "rank": sub["rank"].to_numpy(dtype=np.float64),
+                           "name_score": sub.name.to_numpy(), "address_score": sub.address.to_numpy()},
+                          index=sub.j.to_numpy().astype(np.int64) * span + sub.s1.to_numpy()
+                          ).reindex(key[first])
+        r = at["rank"].to_numpy()
+        rrf = rrf + np.where(np.isnan(r), 0.0, 1.0 / (args.rrf_k + r))
+        for col in at:
+            fused[f"{m}_{col}"] = at[col].to_numpy()
+    fused["rrf"] = rrf
+    fused = fused.iloc[np.lexsort((np.arange(len(fused)), -rrf, fused.j.to_numpy()))].reset_index(drop=True)
+    fused["fused_rank"] = fused.groupby("j").cumcount().to_numpy() + 1
+    return ps, fused[fused.fused_rank <= args.top].reset_index(drop=True)
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -384,55 +445,38 @@ def main():
         if group_states:
             s1_rows = s1_rows[np.isin(s1_state[s1_rows], list(group_states))]
         hits = search_block(S1, Qm, s1_rows, q_rows, args, torch, device, methods) if len(s1_rows) else {}
-
-        cols = {f.name: [] for f in fused_schema}
-        ps = {f.name: [] for f in ps_schema}
-        lines = []
-        for j, q in enumerate(q_rows):
-            truth = labels[q] if labels is not None else ""
-            lists = {m: [] for m in score_methods}
-            for m, (idx, vals, name_vals, addr_vals) in hits.items():
-                kept = [(i, v, nv, av) for i, v, nv, av in zip(idx[:, j], vals[:, j], name_vals[:, j], addr_vals[:, j])
-                        if v > 0]
-                for rank, (i, v, nv, av) in enumerate(kept, start=1):
-                    cid = s1_ids[s1_rows[i]]
-                    lists[m].append((cid, (float(v), float(nv), float(av))))
-                    if cid == truth:
-                        found[m][q] = rank
-                    ps["query_row"].append(q)
-                    ps["method"].append(m)
-                    ps["rank"].append(rank)
-                    ps["s1_id"].append(cid)
-                    ps["score"].append(float(v))
-                    ps["name_score"].append(float(nv))
-                    ps["address_score"].append(float(av))
-                    if labels is not None:
-                        ps["label"].append(int(cid == truth))
-                    if tsv is not None:
-                        is_true = "" if labels is None else int(cid == truth)
-                        lines.append(f"{query_ids[q]}\t{countries[q]}\t{m}\t{rank}\t{cid}\t{v:.4f}\t{nv:.4f}\t"
-                                     f"{av:.4f}\t{is_true}\n")
-            for fused_rank, (cid, rrf, feats) in enumerate(rc.fuse(lists, args.top, args.rrf_k), start=1):
-                cols["query_row"].append(q)
-                cols["s1_id"].append(cid)
-                cols["rrf"].append(rrf)
-                cols["fused_rank"].append(fused_rank)
-                for m in score_methods:
-                    (score, name_score, addr_score), rank = feats.get(m, ((np.nan, np.nan, np.nan), np.nan))
-                    cols[f"{m}_score"].append(score)
-                    cols[f"{m}_rank"].append(rank)
-                    if m in methods:
-                        cols[f"{m}_name_score"].append(name_score)
-                        cols[f"{m}_address_score"].append(addr_score)
-                if labels is not None:
-                    cols["label"].append(int(cid == truth))
-                    if cid == truth:
-                        found["fused"][q] = fused_rank
-        writer.write_table(pa.table(cols, schema=fused_schema))
-        ps_writer.write_table(pa.table(ps, schema=ps_schema))
-        if tsv is not None:
-            tsv.writelines(lines)
-        n_rows += len(cols["query_row"])
+        ps, fused = block_tables(hits, s1_rows, methods, [m for m in score_methods if m in hits], args)
+        if ps is not None:
+            q_ps, q_fused = q_rows[ps.j.to_numpy()], q_rows[fused.j.to_numpy()]
+            ps_ids, fused_ids = s1_ids[ps.s1.to_numpy()], s1_ids[fused.s1.to_numpy()]
+            cols = {"query_row": q_fused.astype(np.int32), "s1_id": fused_ids,
+                    "rrf": fused.rrf.to_numpy().astype(np.float32),
+                    "fused_rank": fused.fused_rank.to_numpy().astype(np.int16)}
+            for m in score_methods:
+                for key in ("score", "rank") + (("name_score", "address_score") if m in methods else ()):
+                    col = f"{m}_{key}"
+                    cols[col] = (fused[col].to_numpy().astype(np.float32) if col in fused
+                                 else np.full(len(fused), np.nan, dtype=np.float32))
+            psc = {"query_row": q_ps.astype(np.int32), "method": ps.m.to_numpy(dtype=object),
+                   "rank": ps["rank"].to_numpy().astype(np.int16), "s1_id": ps_ids,
+                   "score": ps.score.to_numpy(), "name_score": ps.name.to_numpy(),
+                   "address_score": ps.address.to_numpy()}
+            if labels is not None:
+                ps_true = ps_ids == labels[q_ps]
+                fused_true = fused_ids == labels[q_fused]
+                psc["label"], cols["label"] = ps_true.astype(np.int8), fused_true.astype(np.int8)
+                for i, m in enumerate(methods):
+                    sel = ps_true & (ps.pos.to_numpy() == i)
+                    found[m][q_ps[sel]] = ps["rank"].to_numpy()[sel]
+                found["fused"][q_fused[fused_true]] = fused.fused_rank.to_numpy()[fused_true]
+            writer.write_table(pa.table(cols, schema=fused_schema))
+            ps_writer.write_table(pa.table(psc, schema=ps_schema))
+            if tsv is not None:
+                is_true = [""] * len(ps) if labels is None else ps_true.astype(int)
+                tsv.writelines(f"{query_ids[q]}\t{countries[q]}\t{m}\t{r}\t{cid}\t{v:.4f}\t{nv:.4f}\t{av:.4f}\t{t}\n"
+                               for q, m, r, cid, v, nv, av, t in zip(q_ps, ps.m, ps["rank"], ps_ids, ps.score,
+                                                                     ps.name, ps.address, is_true))
+            n_rows += len(fused)
         done += len(q_rows)
         now = time.time()
         if now >= next_report or done == len(df):

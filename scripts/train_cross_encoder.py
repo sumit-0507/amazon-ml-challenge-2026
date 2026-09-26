@@ -79,19 +79,32 @@ def folds(queries):
     return np.array(["A" if zlib.crc32(i.encode()) % 2 == 0 else "B" for i in ids])
 
 
-def record_text(std):
-    """'name | address' per record of a standardized Texts frame."""
+TEXT_MODES = ("both", "name", "address")
+
+
+def text_mode(meta):
+    """Text a trained model reads (models from before --text read 'both')."""
+    return meta.get("text_mode", "both")
+
+
+def record_text(std, mode="both"):
+    """Text per record of a standardized Texts frame: 'name | address', the name or the address."""
+    if mode == "name":
+        return std["name"].to_numpy(dtype=object)
+    if mode == "address":
+        return std["address"].to_numpy(dtype=object)
     return (std["name"] + " | " + std["address"]).to_numpy(dtype=object)
 
 
-def s1_texts(texts):
-    return pd.Series(record_text(texts.s1), index=texts.s1.index)
+def s1_texts(texts, mode="both"):
+    return pd.Series(record_text(texts.s1, mode), index=texts.s1.index)
 
 
-def query_texts(texts, run, queries, rows):
+def query_texts(texts, run, queries, rows, mode="both"):
     """Texts of the given query rows of a run, indexed by query_row."""
     q = queries.iloc[rows]
-    return pd.Series(record_text(texts.queries(run_split(run), q.file_row.to_numpy())), index=q.query_row.to_numpy())
+    return pd.Series(record_text(texts.queries(run_split(run), q.file_row.to_numpy()), mode),
+                     index=q.query_row.to_numpy())
 
 
 def pair_texts(cand, qtext, s1text):
@@ -129,7 +142,7 @@ def predict_logits(model, tok, a, b, batch_size, max_len, device):
 # --------------------------------------------------------------------------
 
 
-def make_pairs(run, rows, queries, texts, top, rand_neg, rng):
+def make_pairs(run, rows, queries, texts, top, rand_neg, rng, mode="both"):
     """Candidates of fused rank <= top for the (sorted) query rows; with rand_neg, also every true match
     and rand_neg random lower-ranked negatives per query (training). Returns (pairs, query texts)."""
     filters = [("query_row", "in", rows.astype(np.int32))]
@@ -146,18 +159,21 @@ def make_pairs(run, rows, queries, texts, top, rand_neg, rng):
     pairs = pd.DataFrame({"q": np.searchsorted(rows, cand.query_row.to_numpy()).astype(np.int32),
                           "s": texts.s1_row.index.get_indexer(cand.s1_id.to_numpy()).astype(np.int32),
                           "label": cand.label.to_numpy(np.int8), "fused_rank": cand.fused_rank.to_numpy(np.int16)})
-    return pairs, record_text(texts.queries(run_split(run), queries.file_row.to_numpy()[rows]))
+    return pairs, record_text(texts.queries(run_split(run), queries.file_row.to_numpy()[rows]), mode)
 
 
-def pair_set(runs, fold, n_queries, texts, top, rand_neg, rng):
-    """Pairs of several runs; query indices offset into one concatenated text table."""
+def pair_set(runs, fold, n_queries, texts, top, rand_neg, rng, mode="both", s1text=None):
+    """Pairs of several runs; query indices offset into one concatenated text table. Pairs with an
+    empty text on either side are dropped (address mode: nothing to compare, never scored)."""
     frames, qtexts, offset = [], [], 0
     for run in runs:
         queries = T.load_queries(run)
         rows = np.arange(len(queries)) if fold is None else np.flatnonzero(folds(queries) == fold)
         if n_queries and len(rows) > n_queries:
             rows = np.sort(rng.choice(rows, n_queries, replace=False))
-        pairs, qtext = make_pairs(run, rows, queries, texts, top, rand_neg, rng)
+        pairs, qtext = make_pairs(run, rows, queries, texts, top, rand_neg, rng, mode)
+        if s1text is not None:
+            pairs = pairs[(qtext[pairs.q.to_numpy()] != "") & (s1text[pairs.s.to_numpy()] != "")].reset_index(drop=True)
         frames.append(pairs.assign(q=pairs.q + offset))
         qtexts.append(qtext)
         offset += len(rows)
@@ -176,12 +192,14 @@ def build_pairs(args, out):
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
     texts = T.Texts(len(os.sched_getaffinity(0)))
-    s1text = record_text(texts.s1)
+    s1text = record_text(texts.s1, args.text)
     log.info(f"S1 texts standardized in {time.time() - t0:.0f}s")
-    log.info(f"train pairs (fold {args.fold}):")
-    train = pair_set(args.train_runs, args.fold, args.train_queries, texts, args.top, args.rand_neg, rng)
+    log.info(f"train pairs (fold {args.fold}, text: {args.text}):")
+    s1_filter = s1text if args.text == "address" else None
+    train = pair_set(args.train_runs, args.fold, args.train_queries, texts, args.top, args.rand_neg, rng,
+                     args.text, s1_filter)
     log.info(f"valid pairs:")
-    valid = pair_set([args.valid_run], None, args.valid_queries, texts, args.top, 0, rng)
+    valid = pair_set([args.valid_run], None, args.valid_queries, texts, args.top, 0, rng, args.text, s1_filter)
     log.info(f"{len(train[0]):,} train pairs ({train[0].label.mean():.2%} positive), {len(valid[0]):,} valid pairs")
     for k, (pairs, qtext) in (("train", train), ("valid", valid)):
         pairs.to_parquet(out / f"pairs-{k}.parquet", index=False)
@@ -327,7 +345,8 @@ def train(args, data, s1text, out):
     model.save_pretrained(out / "model")
     tok.save_pretrained(out / "model")
     (out / "meta.json").write_text(json.dumps({
-        "base": args.base, "text": "name | address (standardized)", "fold": args.fold, "top": args.top,
+        "base": args.base, "text": {"both": "name | address", "name": "name", "address": "address"}[args.text]
+        + " (standardized)", "text_mode": args.text, "fold": args.fold, "top": args.top,
         "max_len": args.max_len, "loss": "binary cross-entropy per pair", "steps": total,
         "train_pairs": len(pairs), "valid_pairs": len(data["valid"][0]), "valid": metrics,
         "train_seconds": round(time.time() - t0), "args": vars(args)}, indent=2))
@@ -340,6 +359,9 @@ def main():
     ap.add_argument("--name", required=True, help="model name in artifacts/cross_encoders/")
     ap.add_argument("--fold", required=True, choices=["A", "B"], help="training fold (the other one is scored)")
     ap.add_argument("--base", default=BASE, help="Hugging Face model to fine-tune")
+    ap.add_argument("--text", choices=TEXT_MODES, default="both",
+                    help="what the model reads: 'name | address', the name only, or the address only "
+                         "(pairs with an empty address are skipped)")
     ap.add_argument("--train-runs", nargs="+", default=TRAIN_RUNS, help="candidate runs of the training split")
     ap.add_argument("--valid-run", default="gpu-tfidf-eval-30")
     ap.add_argument("--train-queries", type=int, default=0, help="cap on the fold's queries per run (0: all)")

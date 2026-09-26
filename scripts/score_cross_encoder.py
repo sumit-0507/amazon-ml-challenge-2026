@@ -10,6 +10,11 @@ with columns query_row, s1_id, ce_logit. Finished chunks are skipped, so an
 interrupted run resumes; a file _done marks a complete run. Candidates below the
 cut get no score (NaN for XGBoost).
 
+--gap D scores instead every candidate whose score in some search is within D of that
+search's own #1 (from <run>.per_search.parquet): one pair when the searches agree on a clear
+winner, all close contenders otherwise. On eval-30, D=0.2 reaches 99.25% of the true matches
+with 3.36 pairs per record (fused top 5: 98.41% with 5).
+
     python scripts/score_cross_encoder.py --models ce-minilm-A ce-minilm-B --run gpu-tfidf-eval-30
     python scripts/score_cross_encoder.py --models ce-minilm-A ce-minilm-B --run gpu-tfidf-train-30
     python scripts/score_cross_encoder.py --models ce-minilm-A ce-minilm-B --run gpu-tfidf-test-part0of4
@@ -40,6 +45,8 @@ def main():
     ap.add_argument("--run", required=True, help="candidate run in artifacts/candidates/")
     ap.add_argument("--name", help="score set name (default: the models' common prefix)")
     ap.add_argument("--top", type=int, help="fused rank cut (default: the models')")
+    ap.add_argument("--gap", type=float, help="score the candidates within this of a search's #1 score "
+                    "instead of the fused top")
     ap.add_argument("--chunk-queries", type=int, default=200_000)
     ap.add_argument("--batch-size", type=int, default=1024)
     args = ap.parse_args()
@@ -48,6 +55,10 @@ def main():
     metas = [json.loads((C.CE / m / "meta.json").read_text()) for m in args.models]
     top = args.top or max(m["top"] for m in metas)
     max_len = max(m["max_len"] for m in metas)
+    modes = {C.text_mode(m) for m in metas}
+    if len(modes) > 1:
+        sys.exit(f"models read different texts ({', '.join(sorted(modes))}); score them as separate sets")
+    mode = modes.pop()
     out = C.SCORES / name / args.run
     if (out / "_done").exists():
         log.info(f"{out} already complete")
@@ -60,15 +71,16 @@ def main():
     t0 = time.time()
     split = C.run_split(args.run)
     texts = T.Texts(len(os.sched_getaffinity(0)), s1_split="test" if split == "test" else "train")
-    s1text = C.s1_texts(texts)
+    s1text = C.s1_texts(texts, mode)
     queries = T.load_queries(args.run)
     qfold = C.folds(queries)
     out_of_fold = split == "train"
     rows = np.arange(len(queries))
     if out_of_fold:  # training records: only those some model did not train on
         rows = rows[np.isin(qfold, [f for f in "AB" if any(m["fold"] != f for m in metas)])]
-    qtext = C.query_texts(texts, args.run, queries, rows)
-    log.info(f"score {args.run} with {', '.join(args.models)} (top {top}, "
+    qtext = C.query_texts(texts, args.run, queries, rows, mode)
+    selection = f"within {args.gap} of a search's #1" if args.gap is not None else f"top {top}"
+    log.info(f"score {args.run} with {', '.join(args.models)} (text: {mode}, {selection}, "
              f"{'out-of-fold' if out_of_fold else 'mean of the models'}) on {device}: {len(rows):,} queries, "
              f"texts ready in {time.time() - t0:.0f}s")
 
@@ -78,14 +90,22 @@ def main():
         path = out / f"part-{chunk[0]:09d}.parquet"
         if path.exists():
             continue
-        cand = pd.read_parquet(T.CAND / f"{args.run}.parquet", columns=["query_row", "s1_id"],
-                               filters=[("query_row", ">=", int(chunk[0])), ("query_row", "<=", int(chunk[-1])),
-                                        ("fused_rank", "<=", top)])
+        in_chunk = [("query_row", ">=", int(chunk[0])), ("query_row", "<=", int(chunk[-1]))]
+        if args.gap is not None:
+            hits = pd.read_parquet(T.CAND / f"{args.run}.per_search.parquet",
+                                   columns=["query_row", "method", "s1_id", "score"], filters=in_chunk)
+            best = hits.groupby(["query_row", "method"]).score.transform("max")
+            cand = hits.loc[best - hits.score <= args.gap, ["query_row", "s1_id"]].drop_duplicates()
+        else:
+            cand = pd.read_parquet(T.CAND / f"{args.run}.parquet", columns=["query_row", "s1_id"],
+                                   filters=in_chunk + [("fused_rank", "<=", top)])
         cand = cand[np.isin(cand.query_row.to_numpy(), chunk)].reset_index(drop=True)
         a, b = C.pair_texts(cand, qtext, s1text)
+        has_text = (a != "") & (b != "") if mode == "address" else np.ones(len(cand), bool)
         total, count = np.zeros(len(cand)), np.zeros(len(cand))
         for (tok, model), meta in zip(models, metas):
             use = (qfold[cand.query_row.to_numpy()] != meta["fold"]) if out_of_fold else np.ones(len(cand), bool)
+            use &= has_text
             idx = np.flatnonzero(use)
             total[idx] += C.predict_logits(model, tok, a[idx], b[idx], args.batch_size, max_len, device)
             count[idx] += 1
@@ -97,7 +117,7 @@ def main():
         log.info(f"  queries {i + len(chunk):,}/{len(rows):,}: {int(scored.sum()):,} pairs  "
                  f"({n_pairs / (time.time() - t1):,.0f} pairs/s, "
                  f"eta {(len(rows) - i - len(chunk)) / n_done * (time.time() - t1) / 60:,.1f} min)")
-    (out / "_done").write_text(json.dumps({"models": args.models, "run": args.run, "top": top}))
+    (out / "_done").write_text(json.dumps({"models": args.models, "run": args.run, "top": top, "gap": args.gap}))
     log.info(f"done: {out}")
 
 
