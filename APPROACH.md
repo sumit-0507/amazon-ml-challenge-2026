@@ -1,6 +1,6 @@
 # Business Entity Resolution — Approach, Round 1 to Round 4
 
-**Team:** Minds&Machines (Sumit Agrawal, Gobinda Panda) · Amazon ML Challenge 2026
+**Team:** Minds&Machines (leader: Sumit Agrawal; member: Gobinda Panda) · Amazon ML Challenge 2026
 
 Final submission: **public leaderboard macro F0.5 0.980**, held-out eval **0.9841**
 (pair precision 0.9984, recall 0.9663).
