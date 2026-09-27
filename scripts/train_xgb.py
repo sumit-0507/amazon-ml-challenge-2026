@@ -248,8 +248,9 @@ def ce_prefix(ce):
         model = (json.loads(done.read_text()).get("models") or [ce])[0]
         break
     meta = ROOT / "artifacts" / "cross_encoders" / model / "meta.json"
-    mode = json.loads(meta.read_text()).get("text_mode", "both") if meta.exists() else "both"
-    return CE_PREFIX[mode]
+    meta = json.loads(meta.read_text()) if meta.exists() else {}
+    base_tag = "g" if "gte" in meta.get("base", "").lower() else ""  # gte base: ceg_*, ceng_*, ceag_*
+    return CE_PREFIX[meta.get("text_mode", "both")] + base_tag
 
 
 def add_all_ce_features(X, cand, ces, run, row_range=None):

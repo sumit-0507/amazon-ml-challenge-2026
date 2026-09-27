@@ -21,7 +21,6 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("HF_HOME", f"/scratch/{os.environ.get('USER', 'ckarfa')}/hf-cache")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np  # noqa: E402

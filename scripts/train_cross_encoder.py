@@ -41,7 +41,6 @@ import time
 import zlib
 from pathlib import Path
 
-os.environ.setdefault("HF_HOME", f"/scratch/{os.environ.get('USER', 'ckarfa')}/hf-cache")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # tokenization runs in DataLoader workers
 
@@ -111,11 +110,35 @@ def pair_texts(cand, qtext, s1text):
     return qtext.loc[cand.query_row.to_numpy()].to_numpy(), s1text.loc[cand.s1_id.to_numpy()].to_numpy()
 
 
+def restore_rope_buffers(model, path):
+    """Models with their own code (gte-multilingual-reranker-base) keep position ids and rotary
+    tables in non-persistent buffers, which transformers 5 leaves uninitialized on load: rebuild
+    them from the checkpoint's config.json."""
+    import torch
+    from huggingface_hub import hf_hub_download
+    mods = [m for m in model.modules() if hasattr(m, "_init_rope") and hasattr(m, "position_ids")]
+    if not mods:
+        return
+    cfg_file = Path(path) / "config.json" if Path(path).is_dir() else hf_hub_download(str(path), "config.json")
+    raw = json.loads(Path(cfg_file).read_text())
+    cfg = model.config
+    cfg.rope_scaling, cfg.rope_theta = raw.get("rope_scaling"), raw.get("rope_theta", 10000.0)
+    for m in mods:
+        with torch.device("cpu"):
+            m._init_rope(cfg)
+        m.position_ids = torch.arange(cfg.max_position_embeddings)
+
+
 def load_model(path, device):
+    import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(path)
-    model = AutoModelForSequenceClassification.from_pretrained(path, num_labels=1).to(device)
-    return tok, model
+    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    # fp32 weights (an fp16 checkpoint such as gte's would otherwise train in fp16 and overflow);
+    # autocast runs the forward pass in bf16
+    model = AutoModelForSequenceClassification.from_pretrained(path, num_labels=1, trust_remote_code=True,
+                                                               dtype=torch.float32)
+    restore_rope_buffers(model, path)
+    return tok, model.to(device)
 
 
 def autocast(torch, device):

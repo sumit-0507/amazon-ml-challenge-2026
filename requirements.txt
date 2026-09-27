@@ -1,19 +1,23 @@
-# Pinned environment for the entity-resolution pipeline (Python 3.12).
-# torch: install the CUDA build matching the machine, e.g. --index-url https://download.pytorch.org/whl/cu126
-anyascii==0.3.3
-duckdb==1.5.5
-joblib==1.6.0
-Metaphone==0.6
+# Pinned environment of the final submission (Python 3.12.13, CUDA GPU).
+# torch: install the CUDA build matching the machine, e.g.
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+torch==2.13.0
+transformers==5.16.1
+tokenizers==0.23.2
+safetensors==0.8.0
+huggingface_hub==1.32.0
+accelerate==1.15.0
+einops==0.8.2
+sentence-transformers==6.1.0
+xgboost==3.4.1
+scikit-learn==1.9.1
 numpy==2.3.5
+scipy==1.18.1
 pandas==3.0.5
 pyarrow==25.0.1
+duckdb==1.5.5
+joblib==1.6.0
 RapidFuzz==3.14.6
-safetensors==0.8.0
-scikit-learn==1.9.1
-scipy==1.18.1
-sentence-transformers==6.1.0
-tokenizers==0.23.2
-transformers==5.16.1
-xgboost==3.4.1
-torch>=2.6
-opensearch-py==3.2.0  # only for the optional OpenSearch retrieval scripts
+anyascii==0.3.3
+Metaphone==0.6
+opensearch-py==3.2.0  # imported by scripts/retrieve_candidates.py (shared helpers); no server needed

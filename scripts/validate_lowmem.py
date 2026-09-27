@@ -12,12 +12,14 @@ checked by the official validator itself.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-VALIDATOR = ROOT / "6ab10eb3b23ba_student_resource" / "student_resource" / "utils" / "validate_submission.py"
+# the official validator: $VALIDATOR, else the copy in the challenge resource folder
+VALIDATOR = Path(os.environ.get("VALIDATOR") or ROOT / "6ab10eb3b23ba_student_resource" / "student_resource" / "utils" / "validate_submission.py")
 sys.path.insert(0, str(VALIDATOR.parent))
 import validate_submission as V  # noqa: E402  (the official ID reader and header)
 
