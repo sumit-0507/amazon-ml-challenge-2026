@@ -82,7 +82,10 @@ def main():
     model.load_model(T.MODELS / f"{args.model}.json")
     queries = T.load_queries(args.run)
     cand = T.load_candidates(args.run)
-    X = pd.read_parquet(T.FEATURES / f"{args.run}-all.parquet")[meta["features"]]
+    X = pd.read_parquet(T.FEATURES / f"{args.run}-all.parquet")
+    if meta.get("ce"):
+        X = T.add_all_ce_features(X, cand, meta["ce"], args.run)
+    X = X[meta["features"]]
     prob = model.predict(xgb.DMatrix(X, missing=np.nan), iteration_range=(0, meta["best_iteration"] + 1))
     del X
     best_s1, best_p = best_per_query(cand, prob, len(queries))
