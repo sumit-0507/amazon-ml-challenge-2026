@@ -25,6 +25,7 @@ computes it.
 2. [Data facts that shaped the design](#2-data-facts-that-shaped-the-design)
 3. [Evaluation setup](#3-evaluation-setup)
 4. [Shared foundation: standardization and blocking](#4-shared-foundation-standardization-and-blocking)
+   (4.3: [the 54 features](#43-the-feature-set-42--54))
 5. [Round 1 — TF-IDF blocking + XGBoost](#5-round-1--tf-idf-blocking--xgboost)
 6. [Round 2 — first cross-encoder](#6-round-2--first-cross-encoder)
 7. [Round 3 — three cross-encoders and an adaptive scoring set](#7-round-3--three-cross-encoders-and-an-adaptive-scoring-set)
@@ -80,7 +81,8 @@ that describe the same business.
 
 ## 4. Shared foundation: standardization and blocking
 
-Used unchanged in all four rounds.
+Standardization (4.1) and blocking (4.2) are unchanged in all four rounds; the feature set (4.3) grows
+from 42 to 54 as cross-encoders are added.
 
 ### 4.1 Standardization (`utils/`)
 
@@ -129,19 +131,108 @@ departments). Example: `KANSAS CITY, MO, 630 45ND TERRACE, null` and
 - **Test candidate set:** **405,956,744 pairs**; every S1 entity has candidates
   (`candidate_pairs.tsv`, identical in all rounds).
 
+### 4.3 The feature set (42 → 54)
+
+Each row XGBoost sees is **one candidate pair**: an S2/S3 record and one of its ~40 candidate S1
+entities. XGBoost gives every pair a match probability; each record keeps its best pair if
+p ≥ threshold. The features describe that pair, in six groups (`scripts/train_xgb.py`,
+`build_features` and `add_ce_features`).
+
+**A. Per-search retrieval — 4 searches × 5 = 20**
+
+For each search `bi`, `tri`, `words`, `phonetic`:
+
+| Feature | Meaning |
+|---|---|
+| `<search>_score` | Combined cosine score = 2 × name similarity + address similarity |
+| `<search>_name_score` | Name part of that score |
+| `<search>_address_score` | Address part of that score |
+| `<search>_rank` | Candidate's position in that search's top 16 (empty if the search did not find it) |
+| `<search>_gap` | Score minus the record's best score in that search (0 = the search's #1) |
+
+**B. Fusion — 5**
+
+| Feature | Meaning |
+|---|---|
+| `rrf` | Reciprocal rank fusion score across the 4 searches |
+| `rrf_gap` | RRF minus the record's best RRF |
+| `fused_rank` | Position after fusion (1 = best) |
+| `n_searches` | How many of the 4 searches found this candidate (0–4) |
+| `n_candidates` | How many candidates the record has in total |
+
+**C. Name similarity — 10** (standardized names; RapidFuzz)
+
+| Feature | Meaning |
+|---|---|
+| `name_ratio` | Edit-distance similarity of the full names |
+| `name_token_set` | Similarity ignoring word order and repeated words |
+| `name_token_sort` | Similarity after sorting the words |
+| `name_partial` | Best match of the shorter name inside the longer one |
+| `name_jaro_winkler` | Similarity weighted toward matching prefixes |
+| `core_ratio` | Edit-distance similarity of the **core names** (legal forms like `pvt ltd` removed) |
+| `core_token_set` | Token-set similarity of the core names |
+| `core_exact` | 1 if the core names are identical |
+| `legal_equal` | 1 if both carry the same legal form (`ltd`/`ltd`, `llc`/`llc`, none/none) |
+| `name_len_diff` | Difference in name length (characters) |
+
+**D. Address — 6**
+
+| Feature | Meaning |
+|---|---|
+| `address_ratio` | Edit-distance similarity of the standardized addresses |
+| `address_token_set` | Token-set similarity of the addresses |
+| `number_jaccard` | Overlap of the numbers in both addresses (house number, PIN, suite) |
+| `first_number_equal` | 1 if the first number (usually the house number) is the same |
+| `query_address_empty` | 1 if the S2/S3 record has no address |
+| `s1_address_empty` | 1 if the S1 record has no address |
+
+**E. Embedding — 1**
+
+| Feature | Meaning |
+|---|---|
+| `embedding_cosine` | Cosine similarity of the multilingual MiniLM name embeddings |
+
+Groups A–E = **42 features** (round 1).
+
+**F. Cross-encoders — 3 per model** (rounds 2–4)
+
+| Feature | Meaning |
+|---|---|
+| `<prefix>_logit` | The cross-encoder's match score for this pair |
+| `<prefix>_gap` | Score minus the record's best score from the same model |
+| `<prefix>_rank` | Position among the record's scored candidates |
+
+All three are empty for pairs the cross-encoder did not score (outside its candidate set).
+
+| Prefix | Model | Reads | Added in |
+|---|---|---|---|
+| `ce_` | MiniLM-L12 | name \| address | Round 2 |
+| `cen_` | MiniLM-L12 | name only | Round 3 |
+| `cea_` | MiniLM-L12 | address only | Round 3 |
+| `ceg_` | gte-multilingual-reranker-base | name \| address | Round 4 |
+
+**How the count grew**
+
+| Round | Features | = |
+|---|---|---|
+| 1 | 42 | 20 (A) + 5 (B) + 10 (C) + 6 (D) + 1 (E) |
+| 2 | 45 | 42 + 3 (`ce_`) |
+| 3 | 51 | 45 + 6 (`cen_`, `cea_`) |
+| 4 | **54** | 51 + 3 (`ceg_`) |
+
+In round 1 the retrieval features led (`words_gap`, `fused_rank`, `number_jaccard`); from round 2
+on the cross-encoder features carry the decision (round 4: `ceg_logit` gain 19,146, `ceg_rank`
+2,667, `ce_logit` 1,732) and the original 42 act mainly as tie-breakers (`fused_rank`,
+`first_number_equal`, `query_address_empty`, `address_token_set`).
+
 ---
 
 ## 5. Round 1 — TF-IDF blocking + XGBoost
 
 **Idea:** a gradient-boosted classifier over cheap retrieval and string-similarity features.
 
-**Features (42):**
-- Retrieval: per search score, rank, name score, address score, gap to the record's best; RRF
-  score and gap; fused rank; number of searches that found the candidate; candidates per record.
-- Names: RapidFuzz ratio, token-set, token-sort, partial ratio, Jaro-Winkler; the same on the
-  **core name** (legal forms removed) plus exact core match; legal-form agreement; length difference;
-  multilingual MiniLM embedding cosine.
-- Addresses: ratio and token-set; Jaccard of the numbers; first number equal; empty address flags.
+**Features (42):** groups A–E of [section 4.3](#43-the-feature-set-42--54): 20 per-search
+retrieval, 5 fusion, 10 name, 6 address, 1 embedding.
 
 **Model:** XGBoost (`xgb-train30-full`), trained on 400k train-30 records with **all** their
 candidates as negatives; early stopping on log-loss → **1,585 trees**. The threshold is swept on the
