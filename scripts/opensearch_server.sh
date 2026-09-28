@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpenSearch server for the entity-resolution indices, run as a Slurm job.
 #
-#   sbatch scripts/opensearch_server.sh
+#   mkdir -p logs && sbatch scripts/opensearch_server.sh     (from the repository root)
 #
 # Listens on 127.0.0.1:${OS_PORT} of the compute node only (security plugin is
 # off, so it is not exposed to other cluster users). Run clients inside the job:
@@ -20,7 +20,7 @@
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=48G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/scratch/ckarfa/opensearch/logs/slurm-%j.out
+#SBATCH --output=logs/opensearch-slurm-%j.out
 
 set -euo pipefail
 

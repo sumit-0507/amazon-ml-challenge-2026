@@ -12,8 +12,8 @@
 # Both GPUs take scoring jobs from one list (a lock per job, so no job runs twice). The small job
 # ends ~18:57; what it has not finished (training resumes from its checkpoint, scoring from its
 # finished chunks) is picked up by the big job. output/ and output-ce/ are never touched.
-cd /home/ckarfa/sumit/AMZ
-PY=/scratch/ckarfa/venvs/sumit/bin/python
+cd "$(dirname "$0")/.."
+PY=${PY:-python3}
 BIG="srun --jobid=14832 --overlap --ntasks=1 --cpus-per-task=6 --mem=40G --gres=gpu:2g.48gb:1"
 BIG_XL="srun --jobid=14832 --overlap --ntasks=1 --cpus-per-task=10 --mem=44G --gres=gpu:2g.48gb:1"
 SMALL="srun --jobid=14824 --overlap --ntasks=1 --cpus-per-task=6 --gres=gpu:1g.24gb:1"
@@ -24,7 +24,7 @@ TRAIN_ARGS="--fold A --train-queries 400000"
 XY="gpu-tfidf-eval-30 gpu-tfidf-train-30"
 TEST="gpu-tfidf-test-part0of4 gpu-tfidf-test-part1of4 gpu-tfidf-test-part2of4 gpu-tfidf-test-part3of4"
 OUT=output-r3
-LOCKS=/scratch/ckarfa/amz/locks-r3b
+LOCKS=${LOCKS:-/scratch/$USER/amz/locks-r3b}
 mkdir -p "$LOCKS" logs
 log() { echo "$(date '+%F %T')  $*" | tee -a logs/run_r3.log; }
 fail() { log "FAILED: $*"; exit 1; }

@@ -21,7 +21,7 @@ MODEL=${2:-xgb-train30-full}
 PARTS=${PARTS:-4}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-PY=${PY:-/scratch/ckarfa/venvs/sumit/bin/python}
+PY=${PY:-python3}
 VALIDATOR=${VALIDATOR:-6ab10eb3b23ba_student_resource/student_resource/utils/validate_submission.py}
 STEP_OPTS=${STEP_OPTS:---cpus-per-task=12 --gres=gpu:2g.48gb:1}
 if [ "$JOB" = local ]; then STEP=""; else STEP="srun --jobid=$JOB --overlap --ntasks=1 $STEP_OPTS"; fi

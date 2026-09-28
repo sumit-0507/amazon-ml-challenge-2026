@@ -22,7 +22,7 @@ NAME=${2:-ce-minilm}
 shift $(( $# < 2 ? $# : 2 ))
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-PY=${PY:-/scratch/ckarfa/venvs/sumit/bin/python}
+PY=${PY:-python3}
 STEP_OPTS=${STEP_OPTS:---cpus-per-task=6 --gres=gpu:1g.24gb:1}
 ALLOC_OPTS=${ALLOC_OPTS:--p gpu_small --gres=gpu:1g.24gb:1 --cpus-per-task=6 --mem=45G}
 mkdir -p logs
